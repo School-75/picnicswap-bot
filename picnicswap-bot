@@ -1,0 +1,361 @@
+import os
+import logging
+import io
+import time
+import csv
+import secrets
+from datetime import datetime
+
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+
+# Wallet signature verification utilities
+from eth_account.messages import encode_defunct
+from eth_account import Account
+
+# Optional Google Sheets
+USE_SHEETS = False
+SHEET_NAME = os.environ.get("SHEET_NAME", "PicnicSwap Contest")
+SERVICE_ACCOUNT_JSON_BASE64 = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64", "")
+SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_PATH", "")
+if SERVICE_ACCOUNT_JSON_BASE64:
+    try:
+        import base64, tempfile
+        data = base64.b64decode(SERVICE_ACCOUNT_JSON_BASE64)
+        tmp = os.path.join("/tmp","gsa.json")
+        with open(tmp,"wb") as f:
+            f.write(data)
+        SERVICE_ACCOUNT_JSON = tmp
+        USE_SHEETS = True
+    except Exception as e:
+        print("Failed to decode GOOGLE_SERVICE_ACCOUNT_JSON_BASE64:", e)
+
+if SERVICE_ACCOUNT_JSON:
+    try:
+        import gspread
+        from oauth2client.service_account import ServiceAccountCredentials
+        scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_JSON, scope)
+        gc = gspread.authorize(creds)
+        try:
+            sh = gc.open(SHEET_NAME)
+        except Exception:
+            # create new spreadsheet if not exists
+            sh = gc.create(SHEET_NAME)
+            # share may be needed depending on account
+        # Ensure two worksheets exist: 'entries' and 'verified'
+        try:
+            entries_ws = sh.worksheet("entries")
+        except Exception:
+            entries_ws = sh.add_worksheet("entries", rows="1000", cols="10")
+            entries_ws.append_row(["user_id","username","nickname","wallet","entered_at"])
+        try:
+            verified_ws = sh.worksheet("verified")
+        except Exception:
+            verified_ws = sh.add_worksheet("verified", rows="1000", cols="3")
+            verified_ws.append_row(["user_id","wallet","verified_at"])
+        USE_SHEETS = True
+    except Exception as e:
+        print("Google Sheets init failed:", e)
+        USE_SHEETS = False
+
+# SQLite fallback
+import sqlite3
+DB_PATH = os.environ.get("DB_PATH", "picnicswap_bot.db")
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS contest_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            nickname TEXT,
+            wallet TEXT,
+            entered_at INTEGER
+        )""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nonces (
+            user_id INTEGER PRIMARY KEY,
+            nonce TEXT,
+            created_at INTEGER
+        )""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS verified_wallets (
+            user_id INTEGER PRIMARY KEY,
+            wallet TEXT,
+            verified_at INTEGER
+        )""")
+    conn.commit()
+    conn.close()
+
+def add_entry_sql(user_id, username, nickname, wallet):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO contest_entries (user_id, username, nickname, wallet, entered_at) VALUES (?,?,?,?,?)",
+                (user_id, username, nickname, wallet, int(time.time())))
+    conn.commit()
+    conn.close()
+
+def list_entries_sql():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, username, nickname, wallet, entered_at FROM contest_entries ORDER BY entered_at DESC")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def set_nonce_sql(user_id, nonce):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("REPLACE INTO nonces (user_id, nonce, created_at) VALUES (?,?,?)",
+                (user_id, nonce, int(time.time())))
+    conn.commit()
+    conn.close()
+
+def get_nonce_sql(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT nonce, created_at FROM nonces WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+def set_verified_sql(user_id, wallet):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("REPLACE INTO verified_wallets (user_id, wallet, verified_at) VALUES (?,?,?)",
+                (user_id, wallet, int(time.time())))
+    conn.commit()
+    conn.close()
+
+def get_verified_sql(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT wallet, verified_at FROM verified_wallets WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+# Sheets helpers (if USE_SHEETS)
+def add_entry_sheet(user_id, username, nickname, wallet):
+    try:
+        entries_ws.append_row([str(user_id), username or "", nickname, wallet, str(int(time.time()))])
+        return True
+    except Exception as e:
+        print("Failed to append to sheet:", e)
+        return False
+
+def list_entries_sheet():
+    try:
+        rows = entries_ws.get_all_records()
+        return rows
+    except Exception as e:
+        print("Failed to read sheet:", e)
+        return []
+
+def set_nonce_sheet(user_id, nonce):
+    # store nonce locally in sqlite for simplicity
+    set_nonce_sql(user_id, nonce)
+
+def get_nonce(user_id):
+    if USE_SHEETS:
+        return get_nonce_sql(user_id)
+    else:
+        return get_nonce_sql(user_id)
+
+def set_verified(user_id, wallet):
+    if USE_SHEETS:
+        try:
+            verified_ws.append_row([str(user_id), wallet, str(int(time.time()))])
+            return True
+        except Exception as e:
+            print("Failed to write verified to sheet:", e)
+            set_verified_sql(user_id, wallet)
+            return False
+    else:
+        set_verified_sql(user_id, wallet)
+        return True
+
+def get_verified(user_id):
+    if USE_SHEETS:
+        try:
+            records = verified_ws.get_all_records()
+            for r in records:
+                if str(r.get("user_id")) == str(user_id):
+                    return (r.get("wallet"), int(r.get("verified_at")))
+            return None
+        except Exception as e:
+            print("Failed to read verified sheet:", e)
+            return get_verified_sql(user_id)
+    else:
+        return get_verified_sql(user_id)
+
+# Config
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
+PROJECT_NAME = os.environ.get("PROJECT_NAME", "PicnicSwap")
+
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Handlers
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = f"👋 Hi {user.first_name}! Welcome to {PROJECT_NAME} community bot. Use /help to see commands."
+    await update.message.reply_text(text)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "/start - Welcome message\n"
+        "/help - Show this message\n"
+        "/enter <nickname> <wallet> - Enter the contest (ex: /enter John 0xabc...)\n"
+        "/verify - Initiate wallet verification (bot will give you a nonce)\n"
+        "/signature <hex_signature> - Submit signature after signing the nonce\n"
+        "/status - Check if your wallet is verified\n"
+        "/entries - (Admin) Export contest entries as CSV\n"
+        "/announce <message> - (Admin) Broadcast message to group/channel\n"
+    )
+    await update.message.reply_text(help_text)
+
+async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for member in update.message.new_chat_members:
+        name = member.full_name
+        text = (
+            f"👋 Welcome {name} to the {PROJECT_NAME} community!\n"
+            "Please read the pinned message and rules.\n"
+            "To participate in contests: use /enter <nickname> <wallet>.\n"
+            "To verify ownership of a wallet (highly recommended): use /verify"
+        )
+        await update.message.reply_text(text)
+
+async def enter_contest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /enter <nickname> <wallet_address>")
+        return
+    nickname = args[0]
+    wallet = args[1]
+    if USE_SHEETS:
+        ok = add_entry_sheet(user.id, user.username or user.full_name, nickname, wallet)
+        if ok:
+            await update.message.reply_text(f"✅ {user.first_name}, you've entered the contest with wallet {wallet}.")
+        else:
+            add_entry_sql(user.id, user.username or user.full_name, nickname, wallet)
+            await update.message.reply_text(f"✅ (saved locally) {user.first_name}, you've entered the contest with wallet {wallet}.")
+    else:
+        add_entry_sql(user.id, user.username or user.full_name, nickname, wallet)
+        await update.message.reply_text(f"✅ {user.first_name}, you've entered the contest with wallet {wallet}.")
+
+async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    nonce = secrets.token_hex(16)
+    set_nonce_sql(user.id, nonce)
+    message = f"Please sign this exact message with your wallet and then use /signature <hex_signature>:\\n\\n{PROJECT_NAME} verification: {nonce}"
+    await update.message.reply_text(message)
+
+async def signature_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /signature <hex_signature> — paste the signature you got from your wallet after signing the nonce")
+        return
+    sig = args[0]
+    row = get_nonce_sql(user.id)
+    if not row:
+        await update.message.reply_text("No active nonce found. Use /verify first to get a nonce to sign.")
+        return
+    nonce, created_at = row
+    try:
+        message = encode_defunct(text=f"{PROJECT_NAME} verification: {nonce}")
+        recovered = Account.recover_message(message, signature=sig)
+    except Exception as e:
+        logger.exception("signature verification failed")
+        await update.message.reply_text(f"❌ Signature verification failed: {e}")
+        return
+    # store verified wallet
+    set_verified(user.id, recovered)
+    await update.message.reply_text(f"✅ Wallet verified: {recovered}")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    row = get_verified(user.id)
+    if not row:
+        await update.message.reply_text("You do not have a verified wallet. Use /verify to start the process.")
+        return
+    wallet, ts = row
+    dt = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S UTC")
+    await update.message.reply_text(f"Verified wallet: {wallet}\\nVerified at: {dt}")
+
+async def entries_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("Unauthorized. This command is for admins only.")
+        return
+    # gather rows from sheet or sqlite
+    rows = []
+    if USE_SHEETS:
+        raw = list_entries_sheet()
+        for r in raw:
+            rows.append((r.get("user_id"), r.get("username"), r.get("nickname"), r.get("wallet"), r.get("entered_at")))
+    else:
+        rows = list_entries_sql()
+    # build CSV
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["user_id","username","nickname","wallet","entered_at"])
+    for r in rows:
+        # r may be dict or tuple
+        try:
+            uid = r[0]
+            username = r[1]
+            nickname = r[2]
+            wallet = r[3]
+            ts = r[4]
+        except Exception:
+            uid = r.get("user_id")
+            username = r.get("username")
+            nickname = r.get("nickname")
+            wallet = r.get("wallet")
+            ts = r.get("entered_at")
+        writer.writerow([uid, username, nickname, wallet, datetime.utcfromtimestamp(int(ts)).isoformat() if str(ts).isdigit() else ts])
+    output.seek(0)
+    await update.message.reply_document(document=io.BytesIO(output.getvalue().encode()), filename="contest_entries.csv")
+
+async def announce_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("Unauthorized. Admins only.")
+        return
+    text = " ".join(context.args) or ""
+    if not text:
+        await update.message.reply_text("Usage: /announce <message>")
+        return
+    await update.message.reply_text(f"📣 Announcement:\\n{text}")
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+
+def main():
+    if not BOT_TOKEN:
+        print("Please set BOT_TOKEN environment variable before running the bot.")
+        return
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("enter", enter_contest))
+    app.add_handler(CommandHandler("verify", verify_command))
+    app.add_handler(CommandHandler("signature", signature_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("entries", entries_command))
+    app.add_handler(CommandHandler("announce", announce_command))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members))
+    app.add_error_handler(error_handler)
+    print("Bot started...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
